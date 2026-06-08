@@ -13,11 +13,12 @@ restarts. Indicator state is rebuilt from market data on every start
 """
 
 from __future__ import annotations
+import os
+os.environ["TZ"] = "UTC"
 
 import asyncio
 import json
 import logging
-import os
 import smtplib
 import sys
 from contextlib import asynccontextmanager
@@ -28,7 +29,6 @@ from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
-
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -113,7 +113,9 @@ def utcnow() -> datetime:
 
 def parse_td_time(ts: str) -> datetime:
     """Parse a Twelve Data timestamp (we always request timezone=UTC)."""
-    return datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    assert dt.tzinfo is timezone.utc  # guaranteed by our timezone=UTC param
+    return dt
 
 
 def fmt_utc(dt: datetime) -> str:
@@ -369,32 +371,25 @@ def save_state() -> None:
 
 BASE_URL = "https://api.twelvedata.com"
 
-
 async def td_time_series(
     outputsize: Optional[int] = None,
     start_date: Optional[datetime] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Fetch 5-min XAU/USD bars from Twelve Data in chronological order (oldest first).
-    `start_date` (UTC) supersedes `outputsize` when provided.
-    Returns list of dicts: {time, open, high, low, close}.
-
-    Includes one retry on transient failure (per MAX_FETCH_RETRIES).
-    """
     params: Dict[str, Any] = {
         "symbol": SYMBOL,
         "interval": INTERVAL,
         "timezone": "UTC",
         "apikey": TWELVEDATA_API_KEY,
-        "order": "asc",  # oldest first — easier for sequential processing
+        "order": "asc",
     }
     if start_date is not None:
-        # +1s so we don't re-receive the bar we already have
         params["start_date"] = (start_date + timedelta(seconds=1)).strftime(
             "%Y-%m-%d %H:%M:%S"
         )
-        # Without outputsize, TD uses default (30). Force a high ceiling for gap fills.
-        params["outputsize"] = 5000
+        # outputsize tells TD how far back to look; start_date truncates the bottom.
+        # We use GAP_FILL_THRESHOLD+10 so any realistic gap fits in one fetch.
+        # No end_date — avoids 400 errors when the latest bar isn't published yet.
+        params["outputsize"] = GAP_FILL_THRESHOLD + 10
     elif outputsize is not None:
         params["outputsize"] = outputsize
 
@@ -403,11 +398,18 @@ async def td_time_series(
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 r = await client.get(f"{BASE_URL}/time_series", params=params)
-                r.raise_for_status()
+                if r.status_code >= 400:
+                    try:
+                        err_body = r.json()
+                        err_msg = err_body.get("message", r.text)
+                        err_code = err_body.get("code", r.status_code)
+                    except Exception:
+                        err_msg = r.text
+                        err_code = r.status_code
+                    log.warning("TD API error %s: %s", err_code, err_msg)
+                    r.raise_for_status()
                 data = r.json()
             if isinstance(data, dict) and data.get("status") == "error":
-                # Twelve Data error envelope. Some "errors" are benign (e.g. "no data
-                # for this date range" when we ask from start_date and no new bars yet).
                 code = data.get("code")
                 msg = data.get("message", "")
                 if code in (400, 404) and "No data" in msg:
@@ -439,8 +441,6 @@ async def td_time_series(
             else:
                 log.error("Fetch failed after %d attempts: %s", attempt + 1, e)
     raise last_err if last_err else RuntimeError("Unknown fetch failure")
-
-
 # =============================================================================
 # COLD START — backfill and warm indicators (silent, no alerts)
 # =============================================================================
@@ -892,8 +892,10 @@ async def worker_loop() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_state()
-    log.info("Service starting (symbol=%s, interval=%s, tz=%s)",
-             SYMBOL, INTERVAL, DISPLAY_TIMEZONE)
+    import time as _time
+    system_tz = _time.tzname
+    log.info("Service starting (symbol=%s, interval=%s, display_tz=%s, system_tz=%s)",
+             SYMBOL, INTERVAL, DISPLAY_TIMEZONE, system_tz)
     task = asyncio.create_task(worker_loop())
     try:
         yield

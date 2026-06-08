@@ -1,0 +1,692 @@
+//@version=6
+// =====================================================================
+// XAUUSD Multi-Strategy Signal Indicator
+// ---------------------------------------------------------------------
+// A single indicator implementing 5 research-backed strategies for gold,
+// selectable from a dropdown. Computes signals on a user-chosen timeframe
+// (independent of chart timeframe), shows entry/SL/TP with extending lines,
+// tracks TP/SL hits on historical and live bars, enforces one-trade-at-a-time,
+// and fires a single dynamic alert covering both buy and sell signals.
+//
+// Designed for: OANDA:XAUUSD (and other XAUUSD feeds)
+// TradingView plan: works on Free (Basic) — no paid features required
+// Fixed Risk:Reward = 1:2
+//
+// FIX (v1.1): Replaced extend.right on lines/boxes with per-bar set_x2/set_right
+//             so objects stay anchored to price coordinates during chart panning.
+//             Also fixed box top/bottom inversion on BUY reward / SELL risk zones.
+// =====================================================================
+
+indicator(
+     title             = "XAUUSD Multi-Strategy Signal Indicator",
+     shorttitle        = "XAU M-Sig",
+     overlay           = true,
+     max_labels_count  = 500,
+     max_lines_count   = 500,
+     max_boxes_count   = 500,
+     max_bars_back     = 500
+ )
+
+// =====================================================================
+// === INPUTS
+// =====================================================================
+
+// --- Strategy selection ----------------------------------------------
+gStrategy = "═══ Strategy Selection ═══"
+strategyChoice = input.string(
+     "1. EMA Pullback (Trend)",
+     "Strategy",
+     options = [
+         "1. EMA Pullback (Trend)",
+         "2. Asian Session Breakout",
+         "3. Bollinger Squeeze Breakout",
+         "4. RSI Mean Reversion (Trend Filtered)",
+         "5. MACD Momentum + Trend"
+     ],
+     group   = gStrategy,
+     tooltip = "Choose ONE strategy at a time. Strategy 2 (Asian Breakout) works best on lower timeframes (15m, 30m, 1h)."
+ )
+
+// --- Timing ----------------------------------------------------------
+gTiming = "═══ Signal Timeframe ═══"
+sigTF = input.timeframe(
+     "5",
+     "Signal Timeframe",
+     options = ["1", "3", "5", "15", "30", "60", "240", "D"],
+     group   = gTiming,
+     tooltip = "Indicator evaluates signals on candle closes of THIS timeframe, regardless of chart timeframe. Free plan: ~5000 bars of history; on 1m chart only the most recent days are visible."
+ )
+
+// --- Risk model ------------------------------------------------------
+gRisk = "═══ Risk Model (Fixed 1:2 RR) ═══"
+slMethod = input.string(
+     "ATR",
+     "Stop-Loss Method",
+     options = ["ATR", "Swing High/Low"],
+     group   = gRisk
+ )
+atrLength = input.int(14,   "ATR Length",                    minval = 1,                   group = gRisk)
+atrMult   = input.float(1.5,"ATR Multiplier",                minval = 0.1, step = 0.1,    group = gRisk,
+     tooltip = "Recommended 1.5–2.0 for XAUUSD due to gold's natural volatility")
+swingLookback = input.int(10, "Swing Lookback Bars",         minval = 2,                   group = gRisk,
+     tooltip = "How many bars back to find recent swing high/low for SL placement")
+
+// --- Strategy 1 params ----------------------------------------------
+gS1 = "── Strategy 1: EMA Pullback ──"
+emaFastLen = input.int(50,  "EMA Fast", minval = 1, group = gS1)
+emaSlowLen = input.int(200, "EMA Slow (Trend Filter)", minval = 1, group = gS1)
+
+// --- Strategy 2 params ----------------------------------------------
+gS2 = "── Strategy 2: Asian Breakout ──"
+asianSession = input.session("0000-0800", "Asian Session (UTC)",
+     group = gS2,
+     tooltip = "Default = 00:00-08:00 UTC. Adjust if your broker uses a different reference timezone.")
+
+// --- Strategy 3 params ----------------------------------------------
+gS3 = "── Strategy 3: BB Squeeze ──"
+bbLength       = input.int(20,   "BB Length",                 minval = 1, group = gS3)
+bbMult         = input.float(2.0,"BB Std Dev",                minval = 0.1, step = 0.1, group = gS3)
+squeezeLookback= input.int(20,   "Squeeze Lookback (bars)",   minval = 5, group = gS3,
+     tooltip = "Squeeze = BB width near its low over this lookback")
+
+// --- Strategy 4 params ----------------------------------------------
+gS4 = "── Strategy 4: RSI Mean Reversion ──"
+rsiLength     = input.int(14,  "RSI Length",                 minval = 1, group = gS4)
+rsiOversold   = input.int(30,  "RSI Oversold",               minval = 1, maxval = 50, group = gS4)
+rsiOverbought = input.int(70,  "RSI Overbought",             minval = 50, maxval = 99, group = gS4)
+rsiTrendLen   = input.int(200, "RSI Trend EMA",              minval = 1, group = gS4,
+     tooltip = "Only take RSI oversold longs when price > this EMA (in uptrend), and vice-versa")
+
+// --- Strategy 5 params ----------------------------------------------
+gS5 = "── Strategy 5: MACD + Trend ──"
+macdFast      = input.int(12, "MACD Fast",                   minval = 1, group = gS5)
+macdSlow      = input.int(26, "MACD Slow",                   minval = 1, group = gS5)
+macdSig       = input.int(9,  "MACD Signal",                 minval = 1, group = gS5)
+macdTrendLen  = input.int(200,"MACD Trend EMA",              minval = 1, group = gS5)
+
+// --- History window --------------------------------------------------
+gDisplay = "═══ History Window ═══"
+historyWindow = input.string(
+     "All (auto-FIFO)",
+     "History Window",
+     options = ["Past","Mid-Past","Mid","Mid-Latest","Latest","All (auto-FIFO)"],
+     group   = gDisplay,
+     tooltip = "Limits where on the chart visuals draw. 'All' uses Pine's FIFO (oldest visuals drop first when 500-object limit is hit). Use Past/Mid/Latest slices to inspect different parts of history."
+ )
+
+// --- Behavior --------------------------------------------------------
+gBehavior = "═══ Behavior ═══"
+sameBarRes = input.string(
+     "Conservative (SL first)",
+     "Same-Bar TP+SL Resolution",
+     options = ["Conservative (SL first)","Optimistic (TP first)"],
+     group   = gBehavior,
+     tooltip = "When a single bar's range hits both TP and SL, which is assumed to have triggered first? Conservative is honest; Optimistic inflates backtest win-rate."
+ )
+entryModel = input.string(
+     "Signal close",
+     "Entry Price Model",
+     options = ["Signal close","Next bar open"],
+     group   = gBehavior,
+     tooltip = "Signal close = enter at exact close of signal bar (theoretical). Next bar open = enter at open of bar after signal (more realistic)."
+ )
+
+// --- Visuals ---------------------------------------------------------
+gVisuals = "═══ Visuals ═══"
+showBoxes    = input.bool(false, "Show risk/reward zone boxes", group = gVisuals,
+     tooltip = "Off by default for cleaner chart and better mobile performance")
+showOutcomes = input.bool(true,  "Show TP/SL hit labels",       group = gVisuals)
+showActive   = input.bool(true,  "Show ACTIVE marker on live trades", group = gVisuals)
+showLevels   = input.bool(true,  "Show Entry/SL/TP lines", group = gVisuals)
+showSignalLabel = input.bool(true, "Show signal label (Entry/SL/TP/RR text)", group = gVisuals)
+showStatsTable  = input.bool(true, "Display metrics box (top-right)",         group = gVisuals)
+
+// --- Modification 1: IST Time-Window Filter ---------------------------
+gMod1 = "═══ Modification 1 (IST Time Windows) ═══"
+applyMod1 = input.bool(false, "Apply Modification 1 (IST window rules)",
+     group   = gMod1,
+     tooltip = "When ON: signals are taken ONLY inside these IST windows, with daily reset.\n\n" +
+               "Window A: candles closing 12:00–12:55 (first signal only).\n" +
+               "Window B: candles closing 18:00–18:55, ONLY if no trade was taken in A.\n" +
+               "Window C: candles closing 19:55–20:30 (first signal only):\n" +
+               "   • 19:55 & 20:00 candles: taken only if no trade in A AND no trade in B.\n" +
+               "   • 20:05–20:30 candles: taken regardless of A/B.\n\n" +
+               "Stats reflect only the trades actually taken under these rules. " +
+               "When OFF, the indicator behaves as before.")
+
+// --- Alerts ----------------------------------------------------------
+gAlerts = "═══ Alerts ═══"
+alertSymbolLabel = input.string("XAUUSD", "Symbol label in alert messages", group = gAlerts)
+alertOnOutcome   = input.bool(false, "Also alert on TP/SL hit (uses a 2nd alert slot)", group = gAlerts,
+     tooltip = "If on, ALSO fires alert when trade resolves. Otherwise only signal entry alerts. Free plan: 3 active alerts total.")
+
+// =====================================================================
+// === STRATEGY ENGINE — runs on Signal TF via request.security
+// =====================================================================
+
+f_strategyEngine() =>
+    // ----- Common indicators on HTF -----
+    emaFast       = ta.ema(close, emaFastLen)
+    emaSlow       = ta.ema(close, emaSlowLen)
+    atrVal        = ta.atr(atrLength)
+    rsiVal        = ta.rsi(close, rsiLength)
+    rsiTrendEMA   = ta.ema(close, rsiTrendLen)
+    macdTrendEMA  = ta.ema(close, macdTrendLen)
+    [macdLine, signalLine, _macdHist] = ta.macd(close, macdFast, macdSlow, macdSig)
+    [bbMiddle, bbUpper, bbLower] = ta.bb(close, bbLength, bbMult)
+    bbWidth       = bbMiddle != 0 ? (bbUpper - bbLower) / bbMiddle : 0.0
+    bbWidthMin    = ta.lowest(bbWidth, squeezeLookback)
+
+    // ----- Swing levels for SL placement -----
+    swingHi = ta.highest(high, swingLookback)
+    swingLo = ta.lowest(low,  swingLookback)
+
+    // ===== Strategy 1: EMA Pullback =====================================
+    s1TrendUp     = close > emaSlow
+    s1TrendDown   = close < emaSlow
+    s1Long  = s1TrendUp   and low  <= emaFast and close > emaFast and close > open
+    s1Short = s1TrendDown and high >= emaFast and close < emaFast and close < open
+
+    // ===== Strategy 2: Asian Session Breakout ===========================
+    inAsian        = not na(time(timeframe.period, asianSession, "UTC"))
+    asianStarting  = inAsian and not inAsian[1]
+
+    var float curAsianHi = na
+    var float curAsianLo = na
+    var bool  asianFinished = false
+
+    if asianStarting
+        curAsianHi := high
+        curAsianLo := low
+        asianFinished := false
+    else if inAsian
+        curAsianHi := math.max(nz(curAsianHi, high), high)
+        curAsianLo := math.min(nz(curAsianLo, low),  low)
+    else if not inAsian and inAsian[1]
+        asianFinished := true
+
+    canBreak = asianFinished and not inAsian and not na(curAsianHi) and not na(curAsianLo)
+    s2Long  = canBreak and close > curAsianHi and nz(close[1], curAsianHi) <= curAsianHi
+    s2Short = canBreak and close < curAsianLo and nz(close[1], curAsianLo) >= curAsianLo
+
+    if s2Long or s2Short
+        asianFinished := false
+
+    // ===== Strategy 3: BB Squeeze Breakout ==============================
+    inSqueeze           = bbWidth <= bbWidthMin * 1.05
+    barsInSqueeze       = ta.barssince(not inSqueeze)
+    sustainedSqueeze    = not na(barsInSqueeze) and barsInSqueeze >= 3
+    prevSqueeze         = not na(barsInSqueeze[1]) and barsInSqueeze[1] >= 3
+    s3Long  = prevSqueeze and close > bbUpper and nz(close[1], bbUpper[1]) <= nz(bbUpper[1], close)
+    s3Short = prevSqueeze and close < bbLower and nz(close[1], bbLower[1]) >= nz(bbLower[1], close)
+    // ===== Strategy 4: RSI Mean Reversion (Trend Filtered) ==============
+    rsiTrendUp   = close > rsiTrendEMA
+    rsiTrendDown = close < rsiTrendEMA
+    rsiRising    = rsiVal > nz(rsiVal[1], rsiVal)
+    rsiFalling   = rsiVal < nz(rsiVal[1], rsiVal)
+    s4Long  = rsiTrendUp   and rsiVal < rsiOversold   and rsiRising  and close > open
+    s4Short = rsiTrendDown and rsiVal > rsiOverbought and rsiFalling and close < open
+
+    // ===== Strategy 5: MACD Momentum + Trend ============================
+    macdCrossUp   = ta.crossover(macdLine,  signalLine)
+    macdCrossDown = ta.crossunder(macdLine, signalLine)
+    macdTrendUp   = close > macdTrendEMA
+    macdTrendDown = close < macdTrendEMA
+    s5Long  = macdTrendUp   and macdCrossUp
+    s5Short = macdTrendDown and macdCrossDown
+
+    // ===== Strategy selector ============================================
+    isLongOut = switch strategyChoice
+        "1. EMA Pullback (Trend)"                 => s1Long
+        "2. Asian Session Breakout"               => s2Long
+        "3. Bollinger Squeeze Breakout"           => s3Long
+        "4. RSI Mean Reversion (Trend Filtered)"  => s4Long
+        "5. MACD Momentum + Trend"                => s5Long
+        =>                                            false
+
+    isShortOut = switch strategyChoice
+        "1. EMA Pullback (Trend)"                 => s1Short
+        "2. Asian Session Breakout"               => s2Short
+        "3. Bollinger Squeeze Breakout"           => s3Short
+        "4. RSI Mean Reversion (Trend Filtered)"  => s4Short
+        "5. MACD Momentum + Trend"                => s5Short
+        =>                                            false
+
+    slLongNatOut = switch strategyChoice
+        "1. EMA Pullback (Trend)"                 => swingLo
+        "2. Asian Session Breakout"               => curAsianLo
+        "3. Bollinger Squeeze Breakout"           => bbLower
+        "4. RSI Mean Reversion (Trend Filtered)"  => swingLo
+        "5. MACD Momentum + Trend"                => swingLo
+        =>                                            na
+
+    slShortNatOut = switch strategyChoice
+        "1. EMA Pullback (Trend)"                 => swingHi
+        "2. Asian Session Breakout"               => curAsianHi
+        "3. Bollinger Squeeze Breakout"           => bbUpper
+        "4. RSI Mean Reversion (Trend Filtered)"  => swingHi
+        "5. MACD Momentum + Trend"                => swingHi
+        =>                                            na
+
+    [isLongOut, isShortOut, slLongNatOut, slShortNatOut, close, open, atrVal, time]
+
+
+// Call the engine on the SIGNAL TIMEFRAME
+[htfLong, htfShort, htfSlLongNat, htfSlShortNat, htfClose, htfOpen, htfAtr, htfTime] =
+     request.security(
+         syminfo.tickerid,
+         sigTF,
+         f_strategyEngine(),
+         lookahead = barmerge.lookahead_off
+     )
+
+// =====================================================================
+// === SIGNAL TIMING
+// =====================================================================
+newHTFBar = not na(htfTime) and htfTime != nz(htfTime[1], htfTime)
+
+// =====================================================================
+// === STATE MANAGEMENT
+// =====================================================================
+var bool   inTrade         = false
+var float  entryPx         = na
+var float  slPx            = na
+var float  tpPx            = na
+var float  exitPx          = na
+var string direction       = na
+var int    entryBar        = na
+var string strategyAtEntry = na
+
+var line   entryLine   = na
+var line   slLine      = na
+var line   tpLine      = na
+var box    riskBox     = na
+var box    rewardBox   = na
+
+var label  activeLbl     = na
+var label  symbolWarnLbl = na
+
+// --- Stats tracking (independent of visual object limits) ---
+var int   statTotal     = 0
+var int   statWins      = 0
+var int   statLosses    = 0
+var int   statCurWin    = 0
+var int   statCurLoss   = 0
+var int   statMaxWin    = 0
+var int   statMaxLoss   = 0
+var table statsTable    = na
+// --- Modification 1 daily state ---
+var bool mod1_A_taken    = false
+var bool mod1_B_taken    = false
+var bool mod1_C_taken    = false
+var int  mod1_lastDayKey = na
+
+// =====================================================================
+// === MODIFICATION 1 — IST WINDOW DETECTION + DAILY RESET
+// =====================================================================
+// Daily reset on IST calendar-day change (year*10000 + month*100 + day)
+istDayKey = year(time, "Asia/Kolkata") * 10000 + month(time, "Asia/Kolkata") * 100 + dayofmonth(time, "Asia/Kolkata")
+if not na(istDayKey) and not na(mod1_lastDayKey) and istDayKey != mod1_lastDayKey
+    mod1_A_taken := false
+    mod1_B_taken := false
+    mod1_C_taken := false
+mod1_lastDayKey := istDayKey
+
+// Signal candle CLOSE time in IST → integer HHMM (e.g. 1200, 1855, 2030)
+sigCloseMs   = na(htfTime) ? na : htfTime + timeframe.in_seconds(sigTF) * 1000
+sigHourIST   = na(sigCloseMs) ? na : hour(sigCloseMs,   "Asia/Kolkata")
+sigMinIST    = na(sigCloseMs) ? na : minute(sigCloseMs, "Asia/Kolkata")
+sigCloseHM   = na(sigHourIST) ? na : sigHourIST * 100 + sigMinIST
+
+// Window membership (close-time HHMM, both bounds inclusive)
+inWindowA = not na(sigCloseHM) and sigCloseHM >= 1200 and sigCloseHM <= 1255
+inWindowB = not na(sigCloseHM) and sigCloseHM >= 1800 and sigCloseHM <= 1855
+inWindowC = not na(sigCloseHM) and sigCloseHM >= 1955 and sigCloseHM <= 2030
+isEarlyC  = not na(sigCloseHM) and sigCloseHM >= 1955 and sigCloseHM <= 2000
+
+// Gate logic — based ONLY on "was a trade taken" flags (not on outcomes)
+mod1Window  = "NONE"
+mod1Allowed = false
+if inWindowA and not mod1_A_taken
+    mod1Allowed := true
+    mod1Window  := "A"
+else if inWindowB and not mod1_B_taken and not mod1_A_taken
+    mod1Allowed := true
+    mod1Window  := "B"
+else if inWindowC and not mod1_C_taken
+    if isEarlyC
+        if not mod1_A_taken and not mod1_B_taken
+            mod1Allowed := true
+            mod1Window  := "C"
+    else
+        mod1Allowed := true
+        mod1Window  := "C"
+
+// Pass-through when mod1 is disabled — preserves original behaviour exactly
+mod1Pass = applyMod1 ? mod1Allowed : true
+
+// =====================================================================
+// === HISTORY WINDOW
+// =====================================================================
+totalBars   = last_bar_index
+windowSize  = math.max(totalBars / 5, 1)
+startBar    = switch historyWindow
+    "Past"            => 0
+    "Mid-Past"        => windowSize
+    "Mid"             => windowSize * 2
+    "Mid-Latest"      => windowSize * 3
+    "Latest"          => windowSize * 4
+    "All (auto-FIFO)" => 0
+    =>                   0
+endBar      = historyWindow == "All (auto-FIFO)" ? totalBars : startBar + windowSize
+canDraw     = bar_index >= startBar and bar_index <= endBar
+
+// =====================================================================
+// === RESOLUTION CHECK + ACTIVE-LINE EXTENSION
+// =====================================================================
+// FIX: Instead of extend.right (screen-relative), we update x2 on every
+//      bar so lines/boxes stay anchored in bar-index price space.
+//      This prevents visual drift when panning or zooming the chart.
+
+if inTrade
+    // ------------------------------------------------------------------
+    // Extend active lines and boxes to the current bar every tick.
+    // This replaces extend.right entirely — lines grow bar-by-bar in
+    // coordinate space rather than stretching to the screen edge.
+    // ------------------------------------------------------------------
+    // if not na(entryLine)
+    //     line.set_x2(entryLine, bar_index)
+    // if not na(slLine)
+    //     line.set_x2(slLine, bar_index)
+    // if not na(tpLine)
+    //     line.set_x2(tpLine, bar_index)
+    // if showBoxes
+    //     if not na(riskBox)
+    //         box.set_right(riskBox, bar_index)
+    //     if not na(rewardBox)
+    //         box.set_right(rewardBox, bar_index)
+
+    // ------------------------------------------------------------------
+    // TP / SL resolution check
+    // ------------------------------------------------------------------
+    isLongTrade = direction == "BUY"
+    tpHit = isLongTrade ? high >= tpPx : low  <= tpPx
+    slHit = isLongTrade ? low  <= slPx : high >= slPx
+
+    if tpHit or slHit
+        outcomeType = ""
+        if tpHit and slHit
+            outcomeType := sameBarRes == "Conservative (SL first)" ? "SL" : "TP"
+        else if tpHit
+            outcomeType := "TP"
+        else
+            outcomeType := "SL"
+
+        levelPx = outcomeType == "TP" ? tpPx : slPx
+        gapPx = float(na)
+        if isLongTrade
+            if outcomeType == "TP"
+                gapPx := open >= tpPx ? open : tpPx
+            else
+                gapPx := open <= slPx ? open : slPx
+        else
+            if outcomeType == "TP"
+                gapPx := open <= tpPx ? open : tpPx
+            else
+                gapPx := open >= slPx ? open : slPx
+
+        exitPx := gapPx
+
+        // --- Record stat ---
+        statTotal += 1
+        if outcomeType == "TP"
+            statWins    += 1
+            statCurWin  += 1
+            statCurLoss := 0
+            statMaxWin  := math.max(statMaxWin, statCurWin)
+        else
+            statLosses  += 1
+            statCurLoss += 1
+            statCurWin  := 0
+            statMaxLoss := math.max(statMaxLoss, statCurLoss)
+
+        // Freeze lines at this exact bar (x2 is already here from the
+        // extension above; this call is now a no-op but kept for clarity)
+        if not na(entryLine)
+            line.set_extend(entryLine, extend.none)
+            line.set_x2(entryLine, bar_index)
+        if not na(slLine)
+            line.set_extend(slLine, extend.none)
+            line.set_x2(slLine, bar_index)
+        if not na(tpLine)
+            line.set_extend(tpLine, extend.none)
+            line.set_x2(tpLine, bar_index)
+        if not na(riskBox)
+            box.set_right(riskBox, bar_index)
+            box.set_extend(riskBox, extend.none)
+        if not na(rewardBox)
+            box.set_right(rewardBox, bar_index)
+            box.set_extend(rewardBox, extend.none)
+
+        // Outcome label
+        if showOutcomes and canDraw
+            isGapExit = math.abs(gapPx - levelPx) > syminfo.mintick * 5
+            outcomePrefix = outcomeType == "TP" ? "✓ TP HIT @ " : "✗ SL HIT @ "
+            gapNote = isGapExit ? " (gap)" : ""
+            outcomeText = outcomePrefix + str.tostring(gapPx, "#.##") + gapNote
+            outcomeColor = outcomeType == "TP" ? color.new(color.green, 10) : color.new(color.red, 10)
+            outcomeStyle = isLongTrade
+                 ? (outcomeType == "TP" ? label.style_label_down : label.style_label_up)
+                 : (outcomeType == "TP" ? label.style_label_up   : label.style_label_down)
+            outcomeY = outcomeType == "TP" ? (isLongTrade ? high : low) : (isLongTrade ? low : high)
+            label.new(bar_index, outcomeY, outcomeText,
+                 color = outcomeColor, textcolor = color.white,
+                 style = outcomeStyle, size = size.small)
+
+        if alertOnOutcome
+            outcomeAlertMsg = alertSymbolLabel + " " + outcomeType + " HIT " + direction +
+                 " | Exit:" + str.tostring(gapPx, "#.##") +
+                 " | Entry was:" + str.tostring(entryPx, "#.##") +
+                 " | Strategy: " + strategyAtEntry
+            alert(outcomeAlertMsg, alert.freq_once_per_bar)
+
+        // Clear active-trade state
+        inTrade   := false
+        entryLine := na
+        slLine    := na
+        tpLine    := na
+        riskBox   := na
+        rewardBox := na
+
+// =====================================================================
+// === NEW SIGNAL
+// =====================================================================
+if newHTFBar and not inTrade and (htfLong or htfShort) and mod1Pass
+    isLongSig = htfLong
+    dirStr    = isLongSig ? "BUY" : "SELL"
+
+    entryCalc = entryModel == "Signal close" ? htfClose : open
+
+    slCalc = float(na)
+    if slMethod == "ATR"
+        slCalc := isLongSig ? entryCalc - atrMult * htfAtr : entryCalc + atrMult * htfAtr
+    else
+        natural = isLongSig ? htfSlLongNat : htfSlShortNat
+        validNatural = not na(natural) and (isLongSig ? natural < entryCalc : natural > entryCalc)
+        if validNatural
+            slCalc := natural
+        else
+            slCalc := isLongSig ? entryCalc - atrMult * htfAtr : entryCalc + atrMult * htfAtr
+
+    validSL = not na(slCalc) and math.abs(entryCalc - slCalc) > syminfo.mintick
+
+    if validSL
+        slDistance = math.abs(entryCalc - slCalc)
+        tpCalc     = isLongSig ? entryCalc + 2 * slDistance : entryCalc - 2 * slDistance
+
+        inTrade         := true
+        entryPx         := entryCalc
+        slPx            := slCalc
+        tpPx            := tpCalc
+        direction       := dirStr
+        entryBar        := bar_index
+        strategyAtEntry := strategyChoice
+
+        // Modification 1: flag the window as "trade taken" for today
+        if applyMod1
+            if mod1Window == "A"
+                mod1_A_taken := true
+            else if mod1Window == "B"
+                mod1_B_taken := true
+            else if mod1Window == "C"
+                mod1_C_taken := true
+ 
+        if canDraw
+            // ----------------------------------------------------------
+            // FIX: Draw lines WITHOUT extend.right.
+            //      x1 = x2 = bar_index on creation. The inTrade block
+            //      above calls line.set_x2() on every subsequent bar,
+            //      so the line grows bar-by-bar in price-coordinate space
+            //      and never anchors to the screen edge.
+            // ----------------------------------------------------------
+            if showLevels
+                entryLine := line.new(bar_index, entryPx, bar_index + 1, entryPx,
+                     extend = extend.right, color = color.new(color.blue, 0), width = 2)
+                slLine := line.new(bar_index, slPx, bar_index + 1, slPx,
+                     extend = extend.right, color = color.new(color.red, 0), width = 2, style = line.style_dashed)
+                tpLine := line.new(bar_index, tpPx, bar_index + 1, tpPx,
+                     extend = extend.right, color = color.new(color.green, 0), width = 2, style = line.style_dashed)
+            if showBoxes
+                // ------------------------------------------------------
+                // FIX: Use math.max/min for top/bottom so boxes draw
+                //      correctly for both BUY and SELL directions.
+                //      Previously the reward box was inverted on BUY
+                //      (entryPx used as top when tpPx > entryPx).
+                // ------------------------------------------------------
+                riskBox := box.new(
+                     bar_index,
+                     math.max(entryPx, slPx),
+                     bar_index,
+                     math.min(entryPx, slPx),
+                     bgcolor      = color.new(color.red, 85),
+                     border_color = color.new(color.red, 50))
+                rewardBox := box.new(
+                     bar_index,
+                     math.max(entryPx, tpPx),
+                     bar_index,
+                     math.min(entryPx, tpPx),
+                     bgcolor      = color.new(color.green, 85),
+                     border_color = color.new(color.green, 50))
+
+            if showSignalLabel
+                sigText = dirStr + " @ " + str.tostring(entryPx, "#.##") +
+                     "\nSL: " + str.tostring(slPx, "#.##") + "  (" +
+                         str.tostring(isLongSig ? slPx - entryPx : entryPx - slPx, "#.##") + ")" +
+                     "\nTP: " + str.tostring(tpPx, "#.##") + "  (+" +
+                         str.tostring(isLongSig ? tpPx - entryPx : entryPx - tpPx, "#.##") + ")" +
+                     "\nRR 1:2"
+                sigColor = isLongSig ? color.new(color.green, 20) : color.new(color.red, 20)
+                sigStyle = isLongSig ? label.style_label_up : label.style_label_down
+                sigY     = isLongSig ? low : high
+                label.new(bar_index, sigY, sigText,
+                     color = sigColor, textcolor = color.white, style = sigStyle, size = size.normal)
+
+        alertMsg = alertSymbolLabel + " " + dirStr + " " + sigTF +
+             " | E:" + str.tostring(entryPx, "#.##") +
+             " SL:" + str.tostring(slPx, "#.##") +
+             " TP:" + str.tostring(tpPx, "#.##") +
+             " | RR 1:2 | " + strategyChoice
+        alert(alertMsg, alert.freq_once_per_bar_close)
+
+// =====================================================================
+// === ACTIVE-TRADE FLOATING LABEL (last bar only)
+// =====================================================================
+if barstate.islast
+    if not na(activeLbl)
+        label.delete(activeLbl)
+        activeLbl := na
+    if inTrade and showActive
+        activeText = "▶ ACTIVE " + direction +
+             "\nE: " + str.tostring(entryPx, "#.##") +
+             "\nSL: " + str.tostring(slPx, "#.##") +
+             "\nTP: " + str.tostring(tpPx, "#.##")
+        midPx = (entryPx + tpPx) / 2
+        activeLbl := label.new(bar_index, midPx, activeText,
+             color = color.new(color.yellow, 30), textcolor = color.black,
+             style = label.style_label_left, size = size.small)
+
+// =====================================================================
+// === SYMBOL-MISMATCH WARNING (last bar only)
+// =====================================================================
+if barstate.islast
+    if not na(symbolWarnLbl)
+        label.delete(symbolWarnLbl)
+        symbolWarnLbl := na
+    if not str.contains(str.lower(syminfo.ticker), "xau")
+        symbolWarnLbl := label.new(bar_index, high, "⚠️ Designed for XAUUSD",
+             color = color.new(color.orange, 10), textcolor = color.white,
+             style = label.style_label_down, size = size.small)
+
+// =====================================================================
+// === STATS TABLE (top-right, updates on every bar)
+// =====================================================================
+if barstate.islast
+    if not na(statsTable)
+        table.delete(statsTable)
+        statsTable := na
+
+    if showStatsTable
+        winRate = statTotal > 0 ? math.round((statWins / statTotal) * 100) : 0
+
+        statsTable := table.new(
+         position.top_right, 2, 7,
+         bgcolor      = color.new(color.black, 30),
+         border_color = color.new(color.gray, 40),
+         border_width = 1,
+         frame_color  = color.new(color.gray, 20),
+         frame_width  = 1)
+
+        // Header
+        table.cell(statsTable, 0, 0, "METRIC",
+            text_color = color.new(color.white, 0),
+            text_size  = size.small,
+            bgcolor    = color.new(color.navy, 20))
+        table.cell(statsTable, 1, 0, "VALUE",
+            text_color = color.new(color.white, 0),
+            text_size  = size.small,
+            bgcolor    = color.new(color.navy, 20))
+
+        // Rows
+        table.cell(statsTable, 0, 1, "Total Trades",
+            text_color = color.new(color.white, 20), text_size = size.small)
+        table.cell(statsTable, 1, 1, str.tostring(statTotal),
+            text_color = color.new(color.white, 0),  text_size = size.small)
+
+        table.cell(statsTable, 0, 2, "Winners",
+            text_color = color.new(color.white, 20), text_size = size.small)
+        table.cell(statsTable, 1, 2, str.tostring(statWins),
+            text_color = color.new(color.green, 0),  text_size = size.small)
+
+        table.cell(statsTable, 0, 3, "Losers",
+            text_color = color.new(color.white, 20), text_size = size.small)
+        table.cell(statsTable, 1, 3, str.tostring(statLosses),
+            text_color = color.new(color.red, 0),    text_size = size.small)
+
+        table.cell(statsTable, 0, 4, "Win Rate",
+            text_color = color.new(color.white, 20), text_size = size.small)
+        table.cell(statsTable, 1, 4, str.tostring(winRate) + "%",
+            text_color = winRate >= 50 ? color.new(color.green, 0) : color.new(color.red, 0),
+            text_size  = size.small)
+
+        table.cell(statsTable, 0, 5, "Max Win Streak",
+            text_color = color.new(color.white, 20), text_size = size.small)
+        table.cell(statsTable, 1, 5, str.tostring(statMaxWin),
+            text_color = color.new(color.green, 0),  text_size = size.small)
+
+        table.cell(statsTable, 0, 6, "Max Loss Streak",
+            text_color = color.new(color.white, 20), text_size = size.small)
+        table.cell(statsTable, 1, 6, str.tostring(statMaxLoss),
+            text_color = color.new(color.red, 0),    text_size = size.small)
+// =====================================================================
+// === END OF SCRIPT
+// =====================================================================
