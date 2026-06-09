@@ -71,6 +71,11 @@ LIVE_CANDLE_DELAY_SEC = 90
 LIVE_RETRY_DELAY_SEC = 20
 LIVE_PENDING_MAX_HOURS = 6
 LIVE_LOOKBACK_DAYS = 10
+# After a locked trade closes, allow a new setup to alert even if it is
+# no longer the absolute latest signal candle, as long as it is recent.
+# This fixes cases where TP/SL and the next setup become visible in the
+# same live fetch/catch-up cycle.
+LIVE_POST_UNLOCK_ALERT_GRACE_BARS = 2
 
 # Market/session sanity filter
 # ----------------------------
@@ -403,6 +408,39 @@ def _trade_matches_any_rule_window(
         if _entry_in_windows(trade["entry_at"], rule["windows"]):
             return rule
     return None
+
+def _is_post_unlock_setup_alertable(
+    trade: Dict[str, Any],
+    just_closed_exit_bar: Optional[str],
+    latest_signal_close_str: str,
+    tf_min: int,
+) -> bool:
+    """
+    Return True when a setup is allowed to alert even though it is not the
+    latest signal close, because the previous timeframe lock closed in this
+    same evaluation cycle.
+
+    This fixes:
+      • previous trade TP/SL at 14:20
+      • new setup entry_at 14:20 or shortly after
+      • latest signal close already advanced to 14:25/14:30 during catch-up
+    """
+    if just_closed_exit_bar is None:
+        return False
+
+    entry_dt = _parse_ist(trade["entry_at"])
+    exit_dt = _parse_ist(just_closed_exit_bar)
+    latest_dt = _parse_ist(latest_signal_close_str)
+
+    # The new setup must be at/after the old trade's exit-bar timestamp.
+    # This matches run_strategy(), which allows a new signal when
+    # sig_close_dt == locked_until_exit_dt.
+    if entry_dt < exit_dt:
+        return False
+
+    # Do not alert very old setups after a long cold start.
+    oldest_allowed = latest_dt - timedelta(minutes=tf_min * LIVE_POST_UNLOCK_ALERT_GRACE_BARS)
+    return entry_dt >= oldest_allowed
 
 # =====================================================================
 # TWELVE DATA API  (stdlib only — no requests/httpx needed)
@@ -1668,6 +1706,15 @@ def _price_diff(entry: float, price: float) -> float:
 def _fmt_price(value: Any) -> str:
     return f"{float(value):.2f}"
 
+def _active_trade_one_line(trade: Dict[str, Any]) -> str:
+    return (
+        f"ACTIVE {trade['tf_min']}m {trade['direction']} | "
+        f"entry_at {trade['entry_at']} IST | "
+        f"entry {_fmt_price(trade['entry'])} | "
+        f"SL {_fmt_price(trade['sl'])} | "
+        f"TP {_fmt_price(trade['tp'])}"
+    )
+
 
 def _strategy_label(rule: Dict[str, Any]) -> str:
     if rule.get("strategy") == "ema_pullback":
@@ -1874,6 +1921,8 @@ def evaluate_live_rules(conn: sqlite3.Connection) -> int:
         # -------------------------------------------------------------
         # A) First check existing timeframe lock from DB.
         # -------------------------------------------------------------
+        just_closed_exit_bar: Optional[str] = None
+
         open_trade = get_open_live_trade_for_tf(conn, tf_min)
 
         if open_trade:
@@ -1882,9 +1931,12 @@ def evaluate_live_rules(conn: sqlite3.Connection) -> int:
             if resolved is None:
                 print(
                     f"  TF {tf_min}m locked: OPEN {open_trade['direction']} "
-                    f"from {open_trade['entry_at']} IST has not hit TP/SL yet"
+                    f"from {open_trade['entry_at']} IST has not hit TP/SL yet | "
+                    f"{_active_trade_one_line(open_trade)}"
                 )
                 continue
+
+            just_closed_exit_bar = resolved["exit_bar"]
 
             close_live_signal(conn, int(open_trade["id"]), resolved)
 
@@ -1954,9 +2006,23 @@ def evaluate_live_rules(conn: sqlite3.Connection) -> int:
 
         # -------------------------------------------------------------
         # D) If the open raw trade is older than the latest signal close,
-        #    it is still an active lock. Do not alert it late.
+        #    normally it is a stale/catch-up trade and should be silent.
+        #
+        #    Exception:
+        #    If this timeframe's previous OPEN trade closed in this same
+        #    evaluation cycle, then a new setup at/after that exit bar is
+        #    allowed to alert if it is still recent enough.
         # -------------------------------------------------------------
-        if raw_open_trade["entry_at"] != latest_signal_close_str:
+        is_latest_signal = raw_open_trade["entry_at"] == latest_signal_close_str
+
+        is_post_unlock_setup = _is_post_unlock_setup_alertable(
+            raw_open_trade,
+            just_closed_exit_bar,
+            latest_signal_close_str,
+            tf_min,
+        )
+
+        if not is_latest_signal and not is_post_unlock_setup:
             if record_live_signal(
                 conn,
                 f"SILENT_TF_LOCK_{tf_min}M",
@@ -1981,6 +2047,13 @@ def evaluate_live_rules(conn: sqlite3.Connection) -> int:
             raw_open_trade,
             silent_lock=False,
         ):
+            if is_post_unlock_setup and not is_latest_signal:
+                print(
+                    f"  TF {tf_min}m post-unlock setup allowed: "
+                    f"{raw_open_trade['direction']} from {raw_open_trade['entry_at']} IST "
+                    f"after previous trade closed at {just_closed_exit_bar} IST"
+                )
+
             _print_live_signal(matching_rule, raw_open_trade)
             send_trade_setup_alert(matching_rule, raw_open_trade)
             event_count += 1
