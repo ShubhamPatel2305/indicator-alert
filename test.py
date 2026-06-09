@@ -69,6 +69,12 @@ SYMBOL_MINTICK = 0.01  # TradingView syminfo.mintick equivalent for most XAUUSD 
 # requesting it. If API still does not have it, retry once after 20 seconds.
 LIVE_CANDLE_DELAY_SEC = 90
 LIVE_RETRY_DELAY_SEC = 20
+
+# Safety buffer so the live loop never wakes a few milliseconds/seconds before
+# the exact API-eligible boundary. This does NOT replace the 90s delay.
+# It only prevents missing the boundary and waiting one full extra 5m cycle.
+LIVE_SCHEDULER_SAFETY_SEC = 8
+
 LIVE_PENDING_MAX_HOURS = 6
 LIVE_LOOKBACK_DAYS = 10
 # After a locked trade closes, allow a new setup to alert even if it is
@@ -677,6 +683,12 @@ def fetch_live_tick_candles(conn: sqlite3.Connection, pending_opens: set[str]) -
     latest_open = latest_api_eligible_5m_open(now)
     if latest_open is None:
         return pending_opens
+
+    print(
+        f"  Live eligibility check: now {_ist_str(now)} IST | "
+        f"latest eligible 5m open {_ist_str(latest_open)} IST | "
+        f"expected close {_ist_str(latest_open + timedelta(minutes=5))} IST"
+    )
 
     latest_open_str = _ist_str(latest_open)
     cutoff = now - timedelta(hours=LIVE_PENDING_MAX_HOURS)
@@ -2065,13 +2077,41 @@ def evaluate_live_rules(conn: sqlite3.Connection) -> int:
 
 
 def _next_live_check_time(now: Optional[datetime] = None) -> datetime:
-    """Next time a newly closed 5m candle should be API-safe."""
+    """
+    Next time a newly closed 5m candle should be API-safe.
+
+    Important:
+    LIVE_CANDLE_DELAY_SEC is the real provider-availability wait.
+    LIVE_SCHEDULER_SAFETY_SEC is only a small buffer to avoid waking just before
+    the exact boundary, which can otherwise push processing to the next 5m cycle.
+    """
     now = now or _now_ist()
+
     latest_open = latest_api_eligible_5m_open(now)
     next_open = latest_open + timedelta(minutes=5)
-    # next_open candle closes five minutes later, then wait availability delay.
-    return next_open + timedelta(minutes=5, seconds=LIVE_CANDLE_DELAY_SEC)
 
+    # next_open candle closes 5 minutes after its open,
+    # then we wait provider delay + tiny scheduler safety.
+    return next_open + timedelta(
+        minutes=5,
+        seconds=LIVE_CANDLE_DELAY_SEC + LIVE_SCHEDULER_SAFETY_SEC,
+    )
+
+def _sleep_until(target_dt: datetime) -> None:
+    """
+    Sleep until target_dt has actually passed.
+
+    This avoids int() truncation and protects against waking slightly before
+    the candle eligibility boundary.
+    """
+    while True:
+        remaining = (target_dt - _now_ist()).total_seconds()
+        if remaining <= 0:
+            return
+
+        # Sleep in chunks so system clock drift / PM2 / VPS scheduling does not
+        # create one huge blind sleep.
+        _time.sleep(min(remaining, 30))
 
 def cmd_live(once: bool = False) -> None:
     if API_KEY == "YOUR_API_KEY_HERE":
@@ -2102,9 +2142,8 @@ def cmd_live(once: bool = False) -> None:
                 break
 
             nxt = _next_live_check_time()
-            sleep_sec = max(5, int((nxt - _now_ist()).total_seconds()))
             print(f"  Next live check at {_ist_str(nxt)} IST\n")
-            _time.sleep(sleep_sec)
+            _sleep_until(nxt)
     except KeyboardInterrupt:
         print("\n  Live monitor stopped by user.")
     finally:
