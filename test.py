@@ -172,19 +172,18 @@ def init_db(db_path: str = DB_FILE) -> sqlite3.Connection:
             UNIQUE(rule_name, tf_min, entry_at, direction, entry)
         )
     """)
-    # Add live-exit columns for old DB files too.
-    # CREATE TABLE IF NOT EXISTS will not modify an existing table,
-    # so we migrate missing columns manually.
     existing_cols = {
         row[1] for row in conn.execute("PRAGMA table_info(live_signals)").fetchall()
     }
 
     live_signal_new_cols = {
-        "exit_bar": "TEXT",          # 5m candle open time where TP/SL was hit
+        "exit_bar": "TEXT",
         "exit_px": "REAL",
         "pnl": "REAL",
-        "closed_at": "TEXT",         # exit candle close time
+        "closed_at": "TEXT",
+        "setup_notified_at": "TEXT",
         "exit_notified_at": "TEXT",
+        "is_silent_lock": "INTEGER DEFAULT 0",
     }
 
     for col, col_type in live_signal_new_cols.items():
@@ -247,14 +246,33 @@ def get_latest_candle_dt(conn: sqlite3.Connection) -> Optional[str]:
     return row[0] if row and row[0] else None
 
 
-def record_live_signal(conn: sqlite3.Connection, rule_name: str, tf_min: int, trade: Dict[str, Any]) -> bool:
-    """Persist a live signal once. Returns True only for a newly recorded signal."""
+def record_live_signal(
+    conn: sqlite3.Connection,
+    rule_name: str,
+    tf_min: int,
+    trade: Dict[str, Any],
+    *,
+    silent_lock: bool = False,
+) -> bool:
+    """
+    Persist a live trade once.
+
+    silent_lock=True means:
+      • trade still locks this timeframe
+      • no setup alert should be sent
+      • used for trades formed outside rule windows
+    """
+    now_str = _ist_str(_now_ist())
+
     try:
         conn.execute(
             """
             INSERT INTO live_signals
-                (rule_name, tf_min, entry_at, direction, entry, sl, tp, outcome, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (
+                    rule_name, tf_min, entry_at, direction, entry, sl, tp,
+                    outcome, created_at, setup_notified_at, is_silent_lock
+                )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 rule_name,
@@ -265,7 +283,9 @@ def record_live_signal(conn: sqlite3.Connection, rule_name: str, tf_min: int, tr
                 float(trade["sl"]),
                 float(trade["tp"]),
                 "OPEN",
-                _ist_str(_now_ist()),
+                now_str,
+                None if silent_lock else now_str,
+                1 if silent_lock else 0,
             ),
         )
         conn.commit()
@@ -275,15 +295,15 @@ def record_live_signal(conn: sqlite3.Connection, rule_name: str, tf_min: int, tr
 
 def get_open_live_trade_for_tf(conn: sqlite3.Connection, tf_min: int) -> Optional[Dict[str, Any]]:
     """
-    Return the oldest OPEN live trade for this timeframe.
-
-    The lock is timeframe-specific:
-      • an OPEN 5m trade blocks only 5m setup scanning
-      • an OPEN 15m trade blocks only 15m setup scanning
+    One active trade per timeframe.
+    A 5m open trade blocks only 5m.
+    A 15m open trade blocks only 15m.
     """
     row = conn.execute(
         """
-        SELECT id, rule_name, tf_min, entry_at, direction, entry, sl, tp, created_at
+        SELECT
+            id, rule_name, tf_min, entry_at, direction, entry, sl, tp,
+            created_at, COALESCE(is_silent_lock, 0)
         FROM live_signals
         WHERE tf_min = ?
           AND COALESCE(outcome, 'OPEN') = 'OPEN'
@@ -299,13 +319,14 @@ def get_open_live_trade_for_tf(conn: sqlite3.Connection, tf_min: int) -> Optiona
     return {
         "id": row[0],
         "rule_name": row[1],
-        "tf_min": row[2],
+        "tf_min": int(row[2]),
         "entry_at": row[3],
         "direction": row[4],
         "entry": float(row[5]),
         "sl": float(row[6]),
         "tp": float(row[7]),
         "created_at": row[8],
+        "is_silent_lock": int(row[9]),
     }
 
 
@@ -314,8 +335,7 @@ def resolve_open_live_trade_on_5m(
     exec_candles_5m: List[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
     """
-    Check whether an already-alerted live trade has now hit TP or SL
-    using raw 5m execution candles.
+    Check whether an already-open live trade has hit TP or SL.
     """
     entry_dt = _parse_ist(open_trade["entry_at"])
     start_idx = _find_exec_start_index(exec_candles_5m, entry_dt)
@@ -335,9 +355,6 @@ def close_live_signal(
     signal_id: int,
     resolved: Dict[str, Any],
 ) -> None:
-    """
-    Mark an OPEN live trade as TP/SL in DB.
-    """
     exit_bar = resolved["exit_bar"]
     closed_at = _ist_str(_parse_ist(exit_bar) + timedelta(minutes=5))
 
@@ -348,21 +365,44 @@ def close_live_signal(
             exit_bar = ?,
             exit_px = ?,
             pnl = ?,
-            closed_at = ?,
-            exit_notified_at = ?
+            closed_at = ?
         WHERE id = ?
         """,
         (
             resolved["outcome"],
-            exit_bar,
+            resolved["exit_bar"],
             float(resolved["exit_px"]),
             float(resolved["pnl"]),
             closed_at,
-            _ist_str(_now_ist()),
             signal_id,
         ),
     )
     conn.commit()
+
+
+def mark_live_exit_notified(conn: sqlite3.Connection, signal_id: int) -> None:
+    conn.execute(
+        """
+        UPDATE live_signals
+        SET exit_notified_at = ?
+        WHERE id = ?
+        """,
+        (_ist_str(_now_ist()), signal_id),
+    )
+    conn.commit()
+
+
+def _trade_matches_any_rule_window(
+    trade: Dict[str, Any],
+    rules: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """
+    Return the first rule whose window allows this trade entry.
+    """
+    for rule in rules:
+        if _entry_in_windows(trade["entry_at"], rule["windows"]):
+            return rule
+    return None
 
 # =====================================================================
 # TWELVE DATA API  (stdlib only — no requests/httpx needed)
@@ -1773,16 +1813,14 @@ PnL: {float(trade['pnl']):+.2f}
 
 def evaluate_live_rules(conn: sqlite3.Connection) -> int:
     """
-    Live engine with timeframe-specific active-trade locks.
+    Live engine with timeframe-specific locks and silent outside-window locks.
 
-    Behavior:
-      1. Group enabled rules by timeframe.
-      2. For each timeframe, first check whether an OPEN trade exists.
-      3. If OPEN trade exists, check TP/SL on latest 5m candles.
-      4. If still OPEN, skip only that timeframe.
-      5. If TP/SL hit, notify and unlock that timeframe.
-      6. After unlock, still check whether a new setup formed on the latest
-         confirmed signal candle. This allows same-cycle re-entry after TP/SL.
+    Correct behavior:
+      • Strategy state runs all day per timeframe.
+      • Rule windows only decide whether to alert.
+      • Outside-window trades still lock the timeframe.
+      • 5m lock does not block 15m.
+      • If TP/SL hits, unlock and then check latest candle for a new setup.
     """
     event_count = 0
     now = _now_ist()
@@ -1802,7 +1840,6 @@ def evaluate_live_rules(conn: sqlite3.Connection) -> int:
         "strategy": "ema_pullback",
     }]
 
-    # Group enabled rules by timeframe so lock is timeframe-specific.
     rules_by_tf: Dict[int, List[Dict[str, Any]]] = {}
 
     for rule in rules_to_check:
@@ -1824,14 +1861,18 @@ def evaluate_live_rules(conn: sqlite3.Connection) -> int:
         data_start_str = _compute_data_window(timedelta(days=LIVE_LOOKBACK_DAYS), tf_min)
 
         candles_5m = load_candles(conn, start_ist=data_start_str)
-        candles_5m, signal_candles = prepare_strategy_candles(candles_5m, tf_min, verbose=False)
+        candles_5m, signal_candles = prepare_strategy_candles(
+            candles_5m,
+            tf_min,
+            verbose=False,
+        )
 
         if not candles_5m or not signal_candles:
             print(f"  No candles available for live TF {tf_min}m")
             continue
 
         # -------------------------------------------------------------
-        # A) First manage any already-open trade for this timeframe.
+        # A) First check existing timeframe lock from DB.
         # -------------------------------------------------------------
         open_trade = get_open_live_trade_for_tf(conn, tf_min)
 
@@ -1855,70 +1896,99 @@ def evaluate_live_rules(conn: sqlite3.Connection) -> int:
                 "pnl": round(float(resolved["pnl"]), 2),
             })
 
-            _print_live_exit(closed_trade)
-            send_trade_exit_alert(closed_trade)
-            event_count += 1
+            if int(open_trade.get("is_silent_lock", 0)) == 0:
+                _print_live_exit(closed_trade)
+                send_trade_exit_alert(closed_trade)
+                mark_live_exit_notified(conn, int(open_trade["id"]))
+                event_count += 1
+            else:
+                print(
+                    f"  TF {tf_min}m silent lock closed: "
+                    f"{closed_trade['outcome']} at {closed_trade['exit_bar']} IST"
+                )
 
-            # Important:
-            # Do NOT continue here.
-            # The timeframe is now unlocked, so we still check whether a new
+            # Do not continue.
+            # Timeframe is now unlocked, so below we check whether a new
             # setup formed on the latest confirmed candle.
 
         # -------------------------------------------------------------
-        # B) Now scan only the latest confirmed signal candle for setup.
+        # B) Run raw strategy for this timeframe with NO window filter.
+        #    This is what keeps live mode aligned with backtest mode.
         # -------------------------------------------------------------
-        latest_signal_close_dt = _candle_close_dt(signal_candles[-1]["dt"], tf_min)
-
-        # Safety: should already be guaranteed by prepare_strategy_candles().
-        if latest_signal_close_dt > latest_exec_close:
-            continue
-
-        entry_scan_start_dt = latest_signal_close_dt - timedelta(minutes=tf_min)
-        entry_scan_start = _ist_str(entry_scan_start_dt)
-        entry_scan_end = _ist_str(latest_signal_close_dt)
-
-        trades = run_strategy(
+        raw_trades = run_strategy(
             signal_candles=signal_candles,
             exec_candles_5m=candles_5m,
             signal_tf_min=tf_min,
-            window_start_ist=entry_scan_start,
+            window_start_ist=None,
             include_open_trade=True,
         )
 
-        setup_recorded_for_tf = False
+        raw_open_trade = raw_trades[-1] if raw_trades and raw_trades[-1].get("outcome") == "OPEN" else None
 
-        for trade in trades:
-            if trade["entry_at"] < entry_scan_start or trade["entry_at"] > entry_scan_end:
-                continue
+        if raw_open_trade is None:
+            continue
 
-            # In live mode, only alert setups that are still active/open.
-            # If a stale setup already resolved during a catch-up gap, skip it.
-            if trade.get("outcome") != "OPEN":
-                continue
+        latest_signal_close_dt = _candle_close_dt(signal_candles[-1]["dt"], tf_min)
+        latest_signal_close_str = _ist_str(latest_signal_close_dt)
 
-            for rule in tf_rules:
-                if LIVE_RULES and not _entry_in_windows(trade["entry_at"], rule["windows"]):
-                    continue
+        matching_rule = _trade_matches_any_rule_window(raw_open_trade, tf_rules)
 
-                if record_live_signal(conn, rule["name"], tf_min, trade):
-                    _print_live_signal(rule, trade)
-                    send_trade_setup_alert(rule, trade)
-                    event_count += 1
-                    setup_recorded_for_tf = True
+        # -------------------------------------------------------------
+        # C) If raw strategy says a trade is open but it is outside your
+        #    alert windows, create a silent lock.
+        # -------------------------------------------------------------
+        if matching_rule is None:
+            if record_live_signal(
+                conn,
+                f"SILENT_TF_LOCK_{tf_min}M",
+                tf_min,
+                raw_open_trade,
+                silent_lock=True,
+            ):
+                print(
+                    f"  TF {tf_min}m silent lock created: "
+                    f"{raw_open_trade['direction']} from {raw_open_trade['entry_at']} IST "
+                    f"outside alert windows"
+                )
+            continue
 
-                # One active trade per timeframe. Once one rule records a setup
-                # for this TF, do not let another same-TF rule duplicate it.
-                if setup_recorded_for_tf:
-                    break
+        # -------------------------------------------------------------
+        # D) If the open raw trade is older than the latest signal close,
+        #    it is still an active lock. Do not alert it late.
+        # -------------------------------------------------------------
+        if raw_open_trade["entry_at"] != latest_signal_close_str:
+            if record_live_signal(
+                conn,
+                f"SILENT_TF_LOCK_{tf_min}M",
+                tf_min,
+                raw_open_trade,
+                silent_lock=True,
+            ):
+                print(
+                    f"  TF {tf_min}m silent lock created for older active trade: "
+                    f"{raw_open_trade['direction']} from {raw_open_trade['entry_at']} IST"
+                )
+            continue
 
-            if setup_recorded_for_tf:
-                break
+        # -------------------------------------------------------------
+        # E) Latest candle formed a valid setup inside one of your windows.
+        #    Alert it and lock this timeframe.
+        # -------------------------------------------------------------
+        if record_live_signal(
+            conn,
+            matching_rule["name"],
+            tf_min,
+            raw_open_trade,
+            silent_lock=False,
+        ):
+            _print_live_signal(matching_rule, raw_open_trade)
+            send_trade_setup_alert(matching_rule, raw_open_trade)
+            event_count += 1
 
     if event_count == 0:
-        print(f"  No new live event at {_ist_str(now)} IST")
+        print(f"  No new live alert at {_ist_str(now)} IST")
 
     return event_count
-
 
 
 def _next_live_check_time(now: Optional[datetime] = None) -> datetime:
