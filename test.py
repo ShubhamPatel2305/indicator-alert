@@ -35,7 +35,8 @@ import urllib.error
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
-
+import smtplib
+from email.message import EmailMessage
 # =====================================================================
 # CONFIGURATION — edit these
 # =====================================================================
@@ -53,7 +54,7 @@ EMA_FAST_LEN = 50
 EMA_SLOW_LEN = 200
 ATR_LEN      = 14
 ATR_MULT     = 1.5
-RR_RATIO     = 2.0        # fixed 1:2
+RR_RATIO     = 2.2        # fixed 1:2
 
 # Seeding
 SEED_START_UTC     = "2026-01-01 00:00:00"
@@ -92,32 +93,51 @@ MARKET_MONDAY_OPEN_IST     = "03:30"  # reject Monday candles before this IST ti
 # Window `end` is EXCLUSIVE. For 18:00-20:00, entries at 18:00..19:55 are allowed,
 # while an entry at exactly 20:00 is excluded because your 20:00 hour tested weaker.
 LIVE_RULES = [
-    # {
-    #     "name": "S1_EMA_PULLBACK_5M_18_20_IST",
-    #     "enabled": True,
-    #     "tf_min": 5,
-    #     "windows": [
-    #         {"start": "18:00", "end": "20:00"},
-    #     ],
-    #     "strategy": "ema_pullback",
-    # },
-    # {
-    #     "name": "S1_EMA_PULLBACK_15M_16_17_IST",
-    #     "enabled": True,
-    #     "tf_min": 15,
-    #     "windows": [
-    #         {"start": "16:00", "end": "17:00"},
-    #     ],
-    #     "strategy": "ema_pullback",
-    # },
-    # Future examples:
-    # {
-    #     "name": "S1_EMA_PULLBACK_15M_18_20_IST",
-    #     "enabled": False,
-    #     "tf_min": 15,
-    #     "windows": [{"start": "18:00", "end": "20:00"}],
-    #     "strategy": "ema_pullback",
-    # },
+    {
+        "name": "S1_EMA_PULLBACK_5M_14_15_IST",
+        "enabled": True,
+        "tf_min": 5,
+        "windows": [
+            {"start": "14:00", "end": "15:00"},
+        ],
+        "strategy": "ema_pullback",
+    },
+    {
+        "name": "S1_EMA_PULLBACK_5M_18_20_IST",
+        "enabled": True,
+        "tf_min": 5,
+        "windows": [
+            {"start": "18:00", "end": "20:00"},
+        ],
+        "strategy": "ema_pullback",
+    },
+    {
+        "name": "S1_EMA_PULLBACK_15M_16_17_IST",
+        "enabled": True,
+        "tf_min": 15,
+        "windows": [
+            {"start": "16:00", "end": "17:00"},
+        ],
+        "strategy": "ema_pullback",
+    },
+    {
+        "name": "S1_EMA_PULLBACK_60M_18_20_IST",
+        "enabled": True,
+        "tf_min": 60,
+        "windows": [
+            {"start": "18:00", "end": "20:00"},
+        ],
+        "strategy": "ema_pullback",
+    },
+    {
+        "name": "S1_EMA_PULLBACK_240M_09_10_IST",
+        "enabled": True,
+        "tf_min": 240,
+        "windows": [
+            {"start": "09:00", "end": "10:00"},
+        ],
+        "strategy": "ema_pullback",
+    },
 ]
 
 
@@ -152,6 +172,24 @@ def init_db(db_path: str = DB_FILE) -> sqlite3.Connection:
             UNIQUE(rule_name, tf_min, entry_at, direction, entry)
         )
     """)
+    # Add live-exit columns for old DB files too.
+    # CREATE TABLE IF NOT EXISTS will not modify an existing table,
+    # so we migrate missing columns manually.
+    existing_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(live_signals)").fetchall()
+    }
+
+    live_signal_new_cols = {
+        "exit_bar": "TEXT",          # 5m candle open time where TP/SL was hit
+        "exit_px": "REAL",
+        "pnl": "REAL",
+        "closed_at": "TEXT",         # exit candle close time
+        "exit_notified_at": "TEXT",
+    }
+
+    for col, col_type in live_signal_new_cols.items():
+        if col not in existing_cols:
+            conn.execute(f"ALTER TABLE live_signals ADD COLUMN {col} {col_type}")
     conn.commit()
     return conn
 
@@ -226,7 +264,7 @@ def record_live_signal(conn: sqlite3.Connection, rule_name: str, tf_min: int, tr
                 float(trade["entry"]),
                 float(trade["sl"]),
                 float(trade["tp"]),
-                trade.get("outcome"),
+                "OPEN",
                 _ist_str(_now_ist()),
             ),
         )
@@ -235,6 +273,96 @@ def record_live_signal(conn: sqlite3.Connection, rule_name: str, tf_min: int, tr
     except sqlite3.IntegrityError:
         return False
 
+def get_open_live_trade_for_tf(conn: sqlite3.Connection, tf_min: int) -> Optional[Dict[str, Any]]:
+    """
+    Return the oldest OPEN live trade for this timeframe.
+
+    The lock is timeframe-specific:
+      • an OPEN 5m trade blocks only 5m setup scanning
+      • an OPEN 15m trade blocks only 15m setup scanning
+    """
+    row = conn.execute(
+        """
+        SELECT id, rule_name, tf_min, entry_at, direction, entry, sl, tp, created_at
+        FROM live_signals
+        WHERE tf_min = ?
+          AND COALESCE(outcome, 'OPEN') = 'OPEN'
+        ORDER BY entry_at ASC
+        LIMIT 1
+        """,
+        (tf_min,),
+    ).fetchone()
+
+    if not row:
+        return None
+
+    return {
+        "id": row[0],
+        "rule_name": row[1],
+        "tf_min": row[2],
+        "entry_at": row[3],
+        "direction": row[4],
+        "entry": float(row[5]),
+        "sl": float(row[6]),
+        "tp": float(row[7]),
+        "created_at": row[8],
+    }
+
+
+def resolve_open_live_trade_on_5m(
+    open_trade: Dict[str, Any],
+    exec_candles_5m: List[Dict[str, Any]],
+) -> Optional[Dict[str, Any]]:
+    """
+    Check whether an already-alerted live trade has now hit TP or SL
+    using raw 5m execution candles.
+    """
+    entry_dt = _parse_ist(open_trade["entry_at"])
+    start_idx = _find_exec_start_index(exec_candles_5m, entry_dt)
+
+    return _resolve_trade_on_5m(
+        exec_candles_5m=exec_candles_5m,
+        start_idx=start_idx,
+        direction=open_trade["direction"],
+        entry=float(open_trade["entry"]),
+        sl=float(open_trade["sl"]),
+        tp=float(open_trade["tp"]),
+    )
+
+
+def close_live_signal(
+    conn: sqlite3.Connection,
+    signal_id: int,
+    resolved: Dict[str, Any],
+) -> None:
+    """
+    Mark an OPEN live trade as TP/SL in DB.
+    """
+    exit_bar = resolved["exit_bar"]
+    closed_at = _ist_str(_parse_ist(exit_bar) + timedelta(minutes=5))
+
+    conn.execute(
+        """
+        UPDATE live_signals
+        SET outcome = ?,
+            exit_bar = ?,
+            exit_px = ?,
+            pnl = ?,
+            closed_at = ?,
+            exit_notified_at = ?
+        WHERE id = ?
+        """,
+        (
+            resolved["outcome"],
+            exit_bar,
+            float(resolved["exit_px"]),
+            float(resolved["pnl"]),
+            closed_at,
+            _ist_str(_now_ist()),
+            signal_id,
+        ),
+    )
+    conn.commit()
 
 # =====================================================================
 # TWELVE DATA API  (stdlib only — no requests/httpx needed)
@@ -1388,7 +1516,7 @@ def cmd_backtest(months: int, tf_min: int) -> None:
 
     print(f"\n{'═'*72}")
     print(f"  {_color('XAUUSD EMA Pullback — BACKTEST', BOLD)}")
-    print(f"  Past {months} month(s)  |  TF: {tf_min}min  |  Strategy 1  |  RR 1:{RR_RATIO:.0f}")
+    print(f"  Past {months} month(s)  |  TF: {tf_min}min  |  Strategy 1  |  RR 1:{RR_RATIO:g}")
     print(f"  Backtest window : {bt_start_str}  →  now")
     print(f"  Data loaded from: {data_start_str}  (for EMA warm-up)")
     print(f"  SL: {ATR_MULT}× ATR({ATR_LEN})   |   Entry: signal candle close")
@@ -1493,26 +1621,54 @@ def _windows_label(windows: List[Dict[str, str]]) -> str:
     return ", ".join(f"{w['start']}–{w['end']}" for w in windows)
 
 
+def _price_diff(entry: float, price: float) -> float:
+    return abs(float(price) - float(entry))
+
+
+def _fmt_price(value: Any) -> str:
+    return f"{float(value):.2f}"
+
+
+def _strategy_label(rule: Dict[str, Any]) -> str:
+    if rule.get("strategy") == "ema_pullback":
+        return "EMA Pullback"
+    return str(rule.get("strategy", "Unknown Strategy"))
+
+
 def _print_live_signal(rule: Dict[str, Any], trade: Dict[str, Any]) -> None:
-    is_long = trade["direction"] == "BUY"
-    dir_color = GREEN if is_long else RED
+    entry = float(trade["entry"])
+    sl = float(trade["sl"])
+    tp = float(trade["tp"])
+
     print(f"\n{'═'*72}")
     print(f"  {_color('LIVE SETUP FORMED', BOLD)}")
-    print(f"  Rule       : {rule['name']}")
-    print(f"  TF         : {rule['tf_min']}min")
-    print(f"  Window     : {_windows_label(rule['windows'])} IST")
-    print(f"  Entry At   : {trade['entry_at']} IST")
-    print(f"  Direction  : {_color(trade['direction'], dir_color)}")
-    print(f"  Entry      : {trade['entry']:.2f}")
-    print(f"  SL         : {trade['sl']:.2f}")
-    print(f"  TP         : {trade['tp']:.2f}")
-    print(f"  EMA50      : {trade['ema50']:.2f}")
-    print(f"  EMA200     : {trade['ema200']:.2f}")
-    print(f"  ATR(14)    : {trade['atr']:.2f}")
-    print(f"  Status     : logged to DB live_signals table")
+    print(f"  Formed     : {trade['entry_at']} IST")
+    print(f"  Timeframe  : {rule['tf_min']}m")
+    print(f"  Strategy   : {_strategy_label(rule)}")
+    print(f"  Direction  : {trade['direction']}")
+    print(f"  Entry      : {_fmt_price(entry)}")
+    print(f"  SL         : {_fmt_price(sl)} ({_price_diff(entry, sl):.2f})")
+    print(f"  TP         : {_fmt_price(tp)} ({_price_diff(entry, tp):.2f})")
+    print(f"  Status     : OPEN, timeframe locked")
     print(f"{'═'*72}\n")
 
-def send_trade_alerts(rule: Dict[str, Any], trade: Dict[str, Any]) -> None:
+
+def _print_live_exit(trade: Dict[str, Any]) -> None:
+    print(f"\n{'═'*72}")
+    print(f"  {_color('LIVE TRADE CLOSED', BOLD)}")
+    print(f"  Result     : {trade['outcome']} HIT")
+    print(f"  Timeframe  : {trade['tf_min']}m")
+    print(f"  Direction  : {trade['direction']}")
+    print(f"  Entry Time : {trade['entry_at']} IST")
+    print(f"  Entry      : {_fmt_price(trade['entry'])}")
+    print(f"  Exit Price : {_fmt_price(trade['exit_px'])}")
+    print(f"  Exit Bar   : {trade['exit_bar']} IST")
+    print(f"  PnL        : {float(trade['pnl']):+.2f}")
+    print(f"  Status     : timeframe unlocked")
+    print(f"{'═'*72}\n")
+
+
+def _send_alert(subject: str, body: str, *, tags: str = "warning") -> None:
     """
     Sends:
       1. ntfy push notification first
@@ -1531,34 +1687,6 @@ def send_trade_alerts(rule: Dict[str, Any], trade: Dict[str, Any]) -> None:
     NTFY_URL = "https://ntfy.sh/xaualertvpsshubham23"
 
     # =========================
-    # TRADE MESSAGE
-    # =========================
-    subject = f"XAUUSD {trade['direction']} Setup Formed | {trade['entry_at']} IST"
-
-    body = f"""
-XAUUSD EMA Pullback Trade Setup Formed
-
-Rule: {rule.get('name')}
-Timeframe: {rule.get('tf_min')} min
-
-Direction: {trade.get('direction')}
-Entry Time: {trade.get('entry_at')} IST
-Signal Candle: {trade.get('entry_bar')} IST
-
-Entry Price: {trade.get('entry')}
-Stop Loss: {trade.get('sl')}
-Take Profit: {trade.get('tp')}
-
-EMA50: {trade.get('ema50')}
-EMA200: {trade.get('ema200')}
-ATR(14): {trade.get('atr')}
-
-Outcome Status: {trade.get('outcome', 'ACTIVE / OPEN')}
-
-Check TradingView before entering.
-"""
-
-    # =========================
     # 1) SEND NTFY PUSH FIRST
     # =========================
     try:
@@ -1569,7 +1697,7 @@ Check TradingView before entering.
             headers={
                 "Title": subject,
                 "Priority": "urgent",
-                "Tags": "warning",
+                "Tags": tags,
             },
         )
         urllib.request.urlopen(req, timeout=10).read()
@@ -1596,15 +1724,67 @@ Check TradingView before entering.
     except Exception as e:
         print(f"  ⚠ email alert failed, continuing anyway: {e}")
 
+
+def send_trade_setup_alert(rule: Dict[str, Any], trade: Dict[str, Any]) -> None:
+    entry = float(trade["entry"])
+    sl = float(trade["sl"])
+    tp = float(trade["tp"])
+
+    subject = f"XAUUSD {trade['direction']} setup | {rule['tf_min']}m | {trade['entry_at']} IST"
+
+    body = f"""XAUUSD Setup Formed
+
+Formed: {trade['entry_at']} IST
+Timeframe: {rule['tf_min']}m
+Strategy: {_strategy_label(rule)}
+Direction: {trade['direction']}
+
+Entry: {_fmt_price(entry)}
+SL: {_fmt_price(sl)} ({_price_diff(entry, sl):.2f})
+TP: {_fmt_price(tp)} ({_price_diff(entry, tp):.2f})
+"""
+
+    _send_alert(subject, body, tags="warning")
+
+
+def send_trade_exit_alert(trade: Dict[str, Any]) -> None:
+    subject = (
+        f"XAUUSD {trade['outcome']} hit | "
+        f"{trade['tf_min']}m {trade['direction']} | "
+        f"entry {trade['entry_at']} IST"
+    )
+
+    body = f"""XAUUSD Trade Closed
+
+Result: {trade['outcome']} HIT
+Timeframe: {trade['tf_min']}m
+Direction: {trade['direction']}
+
+Entry Time: {trade['entry_at']} IST
+Entry: {_fmt_price(trade['entry'])}
+
+Exit Bar: {trade['exit_bar']} IST
+Exit Price: {_fmt_price(trade['exit_px'])}
+PnL: {float(trade['pnl']):+.2f}
+"""
+
+    tags = "white_check_mark" if trade["outcome"] == "TP" else "x"
+    _send_alert(subject, body, tags=tags)
+
 def evaluate_live_rules(conn: sqlite3.Connection) -> int:
     """
-    Evaluate all enabled live rules using the same run_strategy() engine used
-    by test/backtest, but only allow entries from the latest confirmed area.
+    Live engine with timeframe-specific active-trade locks.
 
-    This prevents stale historical trades from being logged as LIVE when the
-    monitor starts or when the DB catches up after a gap.
+    Behavior:
+      1. Group enabled rules by timeframe.
+      2. For each timeframe, first check whether an OPEN trade exists.
+      3. If OPEN trade exists, check TP/SL on latest 5m candles.
+      4. If still OPEN, skip only that timeframe.
+      5. If TP/SL hit, notify and unlock that timeframe.
+      6. After unlock, still check whether a new setup formed on the latest
+         confirmed signal candle. This allows same-cycle re-entry after TP/SL.
     """
-    new_count = 0
+    event_count = 0
     now = _now_ist()
 
     latest_db = get_latest_candle_dt(conn)
@@ -1612,8 +1792,6 @@ def evaluate_live_rules(conn: sqlite3.Connection) -> int:
         print(f"  No candles available for live evaluation at {_ist_str(now)} IST")
         return 0
 
-    # The latest DB candle is stored by open time. Its close is the newest
-    # execution time that can confirm a signal.
     latest_exec_close = _parse_ist(latest_db) + timedelta(minutes=5)
 
     rules_to_check = LIVE_RULES if LIVE_RULES else [{
@@ -1624,27 +1802,80 @@ def evaluate_live_rules(conn: sqlite3.Connection) -> int:
         "strategy": "ema_pullback",
     }]
 
+    # Group enabled rules by timeframe so lock is timeframe-specific.
+    rules_by_tf: Dict[int, List[Dict[str, Any]]] = {}
+
     for rule in rules_to_check:
         if not rule.get("enabled", False):
             continue
+
         if rule.get("strategy") != "ema_pullback":
             print(f"  ⚠ Unsupported live strategy in rule {rule.get('name')}: {rule.get('strategy')}")
             continue
 
         tf_min = int(rule["tf_min"])
-        data_start_str = _compute_data_window(timedelta(days=LIVE_LOOKBACK_DAYS), tf_min)
+        rules_by_tf.setdefault(tf_min, []).append(rule)
 
-        # Load enough warm-up data, but only log trades that closed near the
-        # newest confirmed execution time. This is the stale-live-signal fix.
-        entry_scan_start_dt = latest_exec_close - timedelta(minutes=max(tf_min, 5))
-        entry_scan_start = _ist_str(entry_scan_start_dt)
-        entry_scan_end = _ist_str(latest_exec_close)
+    if not rules_by_tf:
+        print(f"  No enabled live rules at {_ist_str(now)} IST")
+        return 0
+
+    for tf_min, tf_rules in rules_by_tf.items():
+        data_start_str = _compute_data_window(timedelta(days=LIVE_LOOKBACK_DAYS), tf_min)
 
         candles_5m = load_candles(conn, start_ist=data_start_str)
         candles_5m, signal_candles = prepare_strategy_candles(candles_5m, tf_min, verbose=False)
+
         if not candles_5m or not signal_candles:
-            print(f"  No candles available for live rule {rule['name']}")
+            print(f"  No candles available for live TF {tf_min}m")
             continue
+
+        # -------------------------------------------------------------
+        # A) First manage any already-open trade for this timeframe.
+        # -------------------------------------------------------------
+        open_trade = get_open_live_trade_for_tf(conn, tf_min)
+
+        if open_trade:
+            resolved = resolve_open_live_trade_on_5m(open_trade, candles_5m)
+
+            if resolved is None:
+                print(
+                    f"  TF {tf_min}m locked: OPEN {open_trade['direction']} "
+                    f"from {open_trade['entry_at']} IST has not hit TP/SL yet"
+                )
+                continue
+
+            close_live_signal(conn, int(open_trade["id"]), resolved)
+
+            closed_trade = dict(open_trade)
+            closed_trade.update({
+                "outcome": resolved["outcome"],
+                "exit_bar": resolved["exit_bar"],
+                "exit_px": round(float(resolved["exit_px"]), 2),
+                "pnl": round(float(resolved["pnl"]), 2),
+            })
+
+            _print_live_exit(closed_trade)
+            send_trade_exit_alert(closed_trade)
+            event_count += 1
+
+            # Important:
+            # Do NOT continue here.
+            # The timeframe is now unlocked, so we still check whether a new
+            # setup formed on the latest confirmed candle.
+
+        # -------------------------------------------------------------
+        # B) Now scan only the latest confirmed signal candle for setup.
+        # -------------------------------------------------------------
+        latest_signal_close_dt = _candle_close_dt(signal_candles[-1]["dt"], tf_min)
+
+        # Safety: should already be guaranteed by prepare_strategy_candles().
+        if latest_signal_close_dt > latest_exec_close:
+            continue
+
+        entry_scan_start_dt = latest_signal_close_dt - timedelta(minutes=tf_min)
+        entry_scan_start = _ist_str(entry_scan_start_dt)
+        entry_scan_end = _ist_str(latest_signal_close_dt)
 
         trades = run_strategy(
             signal_candles=signal_candles,
@@ -1654,19 +1885,39 @@ def evaluate_live_rules(conn: sqlite3.Connection) -> int:
             include_open_trade=True,
         )
 
+        setup_recorded_for_tf = False
+
         for trade in trades:
             if trade["entry_at"] < entry_scan_start or trade["entry_at"] > entry_scan_end:
                 continue
-            if LIVE_RULES and not _entry_in_windows(trade["entry_at"], rule["windows"]):
-                continue
-            if record_live_signal(conn, rule["name"], tf_min, trade):
-                _print_live_signal(rule, trade)
-                send_trade_alerts(rule, trade)
-                new_count += 1
 
-    if new_count == 0:
-        print(f"  No new live setup at {_ist_str(now)} IST")
-    return new_count
+            # In live mode, only alert setups that are still active/open.
+            # If a stale setup already resolved during a catch-up gap, skip it.
+            if trade.get("outcome") != "OPEN":
+                continue
+
+            for rule in tf_rules:
+                if LIVE_RULES and not _entry_in_windows(trade["entry_at"], rule["windows"]):
+                    continue
+
+                if record_live_signal(conn, rule["name"], tf_min, trade):
+                    _print_live_signal(rule, trade)
+                    send_trade_setup_alert(rule, trade)
+                    event_count += 1
+                    setup_recorded_for_tf = True
+
+                # One active trade per timeframe. Once one rule records a setup
+                # for this TF, do not let another same-TF rule duplicate it.
+                if setup_recorded_for_tf:
+                    break
+
+            if setup_recorded_for_tf:
+                break
+
+    if event_count == 0:
+        print(f"  No new live event at {_ist_str(now)} IST")
+
+    return event_count
 
 
 
